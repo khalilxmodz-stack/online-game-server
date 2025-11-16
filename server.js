@@ -3,77 +3,139 @@ const express = require("express");
 const app = express();
 const http = require("http").createServer(app);
 const io = require("socket.io")(http, {
-  cors: {
-    origin: "*"
-  }
+  cors: { origin: "*" }
 });
 
 const PORT = process.env.PORT || 3000;
 
-// نخلي السيرفر يقدم ملفات ثابتة لو حبيت تحط اللعبة على نفس السيرفر (اختياري)
+// optional: serve a public folder if you host frontend on same server
 app.use(express.static("public"));
 
-// بيانات اللاعبين في الماب
-// players[id] = { x, y, name }
-let players = {};
+// game state
+let players = {}; // id -> { x,y,name,coins,features }
+let coins = {};   // coinId -> { id, x, y }
+let coinCounter = 0;
 
-// لما واحد يتصل بالسيرفر
-io.on("connection", (socket) => {
-  console.log("player connected:", socket.id);
+// utility: spawn initial coins
+function spawnCoin(x,y){
+  const id = 'c'+(coinCounter++);
+  coins[id] = { id, x, y };
+}
 
-  // نضيفه في players بقيم افتراضية
-  players[socket.id] = {
-    x: 2000,
-    y: 2000,
-    name: "Guest"
+function randomMapPos(){
+  return {
+    x: Math.floor(Math.random()*4000),
+    y: Math.floor(Math.random()*4000)
   };
+}
 
-  // نرسل state مباشرًا للجميع
-  io.emit("state", players);
+// spawn some coins at start
+for(let i=0;i<30;i++){
+  const p = randomMapPos();
+  spawnCoin(p.x, p.y);
+}
 
-  // لما اللاعب يرسل بياناته (موقعه + اسمه)
-  socket.on("updatePlayer", (data) => {
-    // data = { x, y, name }
-    if (!players[socket.id]) {
-      players[socket.id] = { x: 2000, y: 2000, name: "Guest" };
-    }
+// broadcast helper
+function broadcastState(){
+  io.emit('state', players);
+  io.emit('coinsState', Object.values(coins));
+}
 
-    if (typeof data.x === "number") players[socket.id].x = data.x;
-    if (typeof data.y === "number") players[socket.id].y = data.y;
-    if (typeof data.name === "string" && data.name.trim() !== "") {
-      players[socket.id].name = data.name.trim().slice(0, 20); // نحدد طول الاسم
-    }
+io.on('connection', (socket) => {
+  console.log('player connected', socket.id);
+  // add player with default values
+  players[socket.id] = { x:2000, y:2000, name:'Guest', coins:0, features:{} };
 
-    // نرسل لكل اللاعبين قائمة اللاعبين
-    io.emit("state", players);
+  // send initial state to everyone
+  broadcastState();
+
+  // updatePlayer from client
+  socket.on('updatePlayer', (data) => {
+    if(!players[socket.id]) players[socket.id] = { x:2000, y:2000, name:'Guest', coins:0, features:{} };
+    if(typeof data.x === 'number') players[socket.id].x = data.x;
+    if(typeof data.y === 'number') players[socket.id].y = data.y;
+    if(typeof data.name === 'string' && data.name.trim() !== '') players[socket.id].name = data.name.trim().slice(0,24);
+    // publish to others (lightweight)
+    io.emit('state', players);
   });
 
-  // استقبال رسالة دردشة من لاعب
-  socket.on("chatMessage", (msg) => {
-    const text = (msg || "").toString().slice(0, 300);
-    const name = players[socket.id]?.name || "Guest";
-
-    // نرسل الرسالة لكل اللاعبين
-    io.emit("chatMessage", {
-      id: socket.id,
-      name,
-      msg: text
-    });
+  // chat
+  socket.on('chatMessage', (msg) => {
+    const text = (msg || '').toString().slice(0,300);
+    const name = players[socket.id]?.name || 'Guest';
+    io.emit('chatMessage', { id: socket.id, name, msg: text });
   });
 
-  // لما اللاعب يخرج
-  socket.on("disconnect", () => {
-    console.log("player disconnected:", socket.id);
+  // collect coin request
+  socket.on('collectCoin', (data) => {
+    const coinId = data && data.coinId;
+    if(!coinId || !coins[coinId]) return;
+    const coin = coins[coinId];
+    const pl = players[socket.id];
+    if(!pl) return;
+    const dx = coin.x - pl.x, dy = coin.y - pl.y;
+    const dist = Math.hypot(dx, dy);
+    // server-side validation: only allow collect if within threshold
+    if(dist <= 48){ // reachable distance
+      // give coin
+      pl.coins = (pl.coins || 0) + 1;
+      // remove coin
+      delete coins[coinId];
+      // spawn a replacement coin somewhere else after short delay
+      setTimeout(() => {
+        const p = randomMapPos();
+        spawnCoin(p.x, p.y);
+        // broadcast new coins state
+        io.emit('coinsState', Object.values(coins));
+      }, 900); // respawn delay
+      // notify and broadcast updated player state
+      io.emit('coinCollected', { coinId, byId: socket.id, newCoins: pl.coins });
+      io.emit('state', players);
+    }
+  });
+
+  // buy feature request
+  socket.on('buyFeature', (obj) => {
+    const feature = obj && obj.feature;
+    const cost = typeof obj.cost === 'number' ? obj.cost : 0;
+    const pl = players[socket.id];
+    if(!pl) return;
+    if(pl.coins >= cost){
+      // apply feature (simple: support 'speed')
+      pl.coins -= cost;
+      if(!pl.features) pl.features = {};
+      if(feature === 'speed'){
+        pl.features.speed = true;
+        // optional: set timeout for temporary boost (e.g., 60s)
+        setTimeout(() => {
+          if(players[socket.id]) {
+            players[socket.id].features.speed = false;
+            io.emit('state', players);
+          }
+        }, 60000); // 60 seconds
+      } else {
+        pl.features[feature] = true;
+      }
+      io.emit('buyResult', { ok:true, feature, newCoins: pl.coins });
+      io.emit('state', players);
+    } else {
+      io.emit('buyResult', { ok:false, reason:'لا يوجد عملات كافية' });
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('player disconnected', socket.id);
     delete players[socket.id];
-    io.emit("state", players);
+    io.emit('state', players);
   });
 });
 
-// تشغيل السيرفر
+// periodic broadcast to keep clients in sync
+setInterval(() => {
+  io.emit('state', players);
+  io.emit('coinsState', Object.values(coins));
+}, 800);
+
 http.listen(PORT, () => {
-  console.log("Server listening on port", PORT);
+  console.log('Server listening on port', PORT);
 });
-
-// By Khalil Xmodz
-
-// By Khalil Xmodz
